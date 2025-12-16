@@ -1,0 +1,160 @@
+@dataclass
+class Leg:
+    instrument: str
+    strike: float
+    option_type: str
+    side: str
+    delta: float
+    gamma: float
+    vega: float
+    theta: float
+    price: float
+    iv: float
+    crr_delta: float = None
+    crr_gamma: float = None
+    crr_vega: float = None
+    crr_theta: float = None
+
+@dataclass
+class Position:
+    entry_time: datetime
+    expiry_time: datetime
+    legs: list
+    entry_premium: float
+
+class OptionType(Enum):
+    CALL = "C"
+    PUT = "P"
+
+class Greeks:
+    r = 0.04 # fed fund rate
+    @staticmethod
+    def _d1_d2(S, K, T, r, sigma):
+        if T <= 0 or sigma <= 0:
+            sign = np.sign(S - K)
+            inf = np.inf * sign
+            return inf, inf
+
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        return d1, d2
+
+    @staticmethod
+    def bs_delta(S, K, T, r, sigma, option_type):
+        d1, _ = Greeks._d1_d2(S, K, T, r, sigma)
+        if option_type == OptionType.CALL:
+            return norm.cdf(d1)  
+        else:
+            return norm.cdf(d1) - 1.0  
+
+    @staticmethod
+    def bs_gamma(S, K, T, r, sigma):
+        d1, _ = Greeks._d1_d2(S, K, T, r, sigma)
+        return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+
+    @staticmethod
+    def bs_vega(S, K, T, r, sigma):
+        d1, _ = Greeks._d1_d2(S, K, T, r, sigma)
+        return S * norm.pdf(d1) * np.sqrt(T)
+
+    @staticmethod
+    def bs_theta(S, K, T, r, sigma, option_type):
+        d1, d2 = Greeks._d1_d2(S, K, T, r, sigma)
+        first = - (S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
+
+        if option_type == OptionType.CALL:
+            second = - r * K * np.exp(-r * T) * norm.cdf(d2)
+            return first + second
+        else:
+            second = r * K * np.exp(-r * T) * norm.cdf(-d2)
+            return first + second
+
+    @staticmethod
+    def crr_euro_call(S, K, r, T, sigma, n):
+        dt = T / n 
+        u = np.exp(sigma * np.sqrt(dt)) 
+        d = 1 / u 
+        p = (np.exp(r * dt) - d) / (u - d)
+
+        ST = S * (u ** np.arange(n, -1, -1)) * (d ** np.arange(0, n + 1, 1))
+        payoff = np.maximum(ST - K, 0)
+
+        for j in range(n - 1, -1, -1):
+            payoff = np.exp(-r * dt) * (p * payoff[:-1] + (1 - p) * payoff[1:]) 
+
+        return payoff[0]
+
+    @staticmethod
+    def crr_euro_put(S, K, r, T, sigma, n):
+        dt = T / n  
+        u = np.exp(sigma * np.sqrt(dt)) 
+        d = 1 / u
+        p = (np.exp(r * dt) - d) / (u - d)
+
+        ST = S * (u ** np.arange(n, -1, -1)) * (d ** np.arange(0, n + 1, 1)) 
+        payoff = np.maximum(K - ST, 0) 
+    
+        for j in range(n - 1, -1, -1):
+            payoff = np.exp(-r * dt) * (p * payoff[:-1] + (1 - p) * payoff[1:]) 
+
+        return payoff[0] 
+
+    @staticmethod
+    def binomial_greeks(S, strike, r, T, vol, greek_type, option_type, n=300):
+        dt = T / n
+        u = np.exp(vol * np.sqrt(dt)) 
+        d = 1 / u 
+        p = (np.exp(r * dt) - d) / (u - d)
+        dS = 0.001 * S
+
+        if option_type == OptionType.CALL:
+            binomial_tree = Greeks.crr_euro_call
+        else:
+            binomial_tree = Greeks.crr_euro_put
+
+        if greek_type == 'delta':
+            option_price_up = binomial_tree(S * (1 + 0.001), strike, r, T, vol, n)
+            option_price_down = binomial_tree(S * (1 - 0.001), strike, r, T, vol, n)
+            return (option_price_up - option_price_down) / (2 * dS)
+
+        elif greek_type == 'gamma':
+            option_price_up = binomial_tree(S * (1 + 0.001), strike, r, T, vol, n)
+            option_price_down = binomial_tree(S * (1 - 0.001), strike, r, T, vol, n)
+            option_price_mid = binomial_tree(S, strike, r, T, vol, n)
+            return (option_price_up - 2 * option_price_mid + option_price_down) / (dS ** 2)
+
+        elif greek_type == 'vega':
+            option_price_up = binomial_tree(S, strike, r, T, vol + 0.001, n)
+            option_price_down = binomial_tree(S, strike, r, T, vol - 0.001, n)
+            return (option_price_up - option_price_down) / (2 * 0.001) 
+
+        elif greek_type == 'theta':
+            dT = min(0.001, T * 0.5)
+            if T <= 1e-6:
+                return 0.0
+            option_price_up = binomial_tree(S, strike, r, T - dT, vol, n)
+            option_price_down = binomial_tree(S, strike, r, T, vol, n)
+            return (option_price_up - option_price_down) / dT
+
+            
+    @staticmethod
+    def calculate_greeks(df: pd.DataFrame, r: float) -> pd.DataFrame:
+        df['delta'] = np.nan
+        df['gamma'] = np.nan
+        df['vega'] = np.nan
+        df['theta'] = np.nan
+    
+        for i, row in df.iterrows():
+            S = row['spot_price'] 
+            K = row['strike'] 
+            sigma = row['iv'] / 100
+            T = row['expiry_hrs'] / (365.25 * 24)  # tte yrs
+            r = 0.04
+            option_type = OptionType(row['option_type']) 
+    
+            df.at[i, 'delta'] = Greeks.bs_delta(S, K, T, r, sigma, option_type)
+            df.at[i, 'gamma'] = Greeks.bs_gamma(S, K, T, r, sigma)
+            df.at[i, 'vega'] = Greeks.bs_vega(S, K, T, r, sigma)
+            df.at[i, 'theta'] = Greeks.bs_theta(S, K, T, r, sigma, option_type)
+    
+        return df
