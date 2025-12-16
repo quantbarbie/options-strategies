@@ -337,3 +337,288 @@ class Strategy:
                 if not row.empty and abs(row["delta"].iloc[0]) >= threshold:
                     return True
         return False
+class Backtest:
+    def __init__(self, df: pd.DataFrame, data_loader, strategy, entry_hours: int, candle_frequency: str, 
+                 hours_elapsed_limit: float, profit_target_pct: float, 
+                 capital: float = 1, position_size: float = 0.1):
+
+        self.df = df
+        self.data = data_loader
+        self.strategy = strategy
+        self.entry_hours = entry_hours
+        self.candle_frequency = candle_frequency
+        self.hours_elapsed_limit = hours_elapsed_limit
+        self.profit_target_pct = profit_target_pct
+        self.capital = capital
+        self.position_size = position_size
+
+    def backtest(self) -> pd.DataFrame:
+        self.df = self.df.sort_values("timestamp")
+        expiries = pd.DatetimeIndex(self.df["expiry"].unique()).sort_values()
+
+        trades = []
+        greeks_rows = []
+
+        for expiry in expiries:
+            entry_time = expiry - timedelta(hours=self.entry_hours)
+
+            chain = self.data.chain_snapshot(self.df, entry_time, expiry)
+            # print(chain.head())
+
+            if chain.empty:
+                continue
+
+            legs = self.strategy.iron_condor(chain)
+
+            if legs is None:
+                continue
+                
+            try:
+                S = chain["spot_price"].iloc[0]
+                T = chain["T"].iloc[0]
+                r = 0.04
+                n = 500 
+                
+                for leg in legs:
+                    K = leg.strike
+                    sigma = leg.iv / 100.0
+                    opt_type = OptionType(leg.option_type)
+                
+                    leg.crr_delta = Greeks.binomial_greeks(S, K, r, T, sigma, "delta", opt_type, n)
+                    leg.crr_gamma = Greeks.binomial_greeks(S, K, r, T, sigma, "gamma", opt_type, n)
+                    leg.crr_vega  = Greeks.binomial_greeks(S, K, r, T, sigma, "vega",  opt_type, n)
+                    leg.crr_theta = Greeks.binomial_greeks(S, K, r, T, sigma, "theta", opt_type, n)
+
+                    greeks_rows.append({
+                        "entry_time": entry_time,
+                        "expiry": expiry,
+                        "instrument": leg.instrument,
+                        "side": leg.side,
+                        "strike": leg.strike,
+                        "option_type": leg.option_type,
+                        "iv": leg.iv,
+                        "S": S,
+                        "T": T,
+                        "bs_delta": leg.delta,
+                        "bs_gamma": leg.gamma,
+                        "bs_vega":  leg.vega,
+                        "bs_theta": leg.theta,
+                        "crr_delta": leg.crr_delta,
+                        "crr_gamma": leg.crr_gamma,
+                        "crr_vega":  leg.crr_vega,
+                        "crr_theta": leg.crr_theta
+                    })
+
+                    
+            except Exception as e:
+                print("CRR error:", e)
+                continue
+                
+            ep = self.strategy.calc_premium(legs) 
+
+            if ep <= 0:
+                continue
+
+            entry_premium = ep * self.position_size
+            
+            exit_time = None
+            exit_reason = None
+            exit_value = None
+            last_valid_value = None 
+            
+            check_times = pd.date_range(entry_time, expiry, freq=self.candle_frequency)
+            
+            for t in check_times:
+                hours_elapsed = (t - entry_time).total_seconds() / 3600
+            
+                snap = self.data.chain_snapshot(self.df, t, expiry)
+                if snap.empty:
+                    if hours_elapsed >= self.hours_elapsed_limit:
+                        exit_time = t
+                        exit_reason = "time_stop"
+                        exit_value = last_valid_value if last_valid_value is not None else entry_premium
+                        break
+                    continue
+            
+                cv = self.strategy.calc_current_value(snap, legs)
+            
+                if cv is None:
+                    if hours_elapsed >= self.hours_elapsed_limit:
+                        exit_time = t
+                        exit_reason = "time_stop"
+                        exit_value = last_valid_value if last_valid_value is not None else entry_premium
+                        break
+                    continue
+                    
+                current_value = cv * self.position_size
+                last_valid_value = current_value 
+                pnl_pct = (entry_premium - current_value) / entry_premium
+            
+                if pnl_pct >= self.profit_target_pct:
+                    exit_time = t
+                    exit_reason = "profit_target"
+                    exit_value = current_value
+                    break
+            
+                if hours_elapsed >= self.hours_elapsed_limit:
+                    exit_time = t
+                    exit_reason = "time_stop"
+                    exit_value = current_value
+                    break
+            
+                if self.strategy.check_delta_breach(snap, legs):
+                    exit_time = t
+                    exit_reason = "delta_breach"
+                    exit_value = current_value
+                    break
+
+            if exit_time is None:
+                exit_time = expiry
+                exit_reason = "expiry"
+
+                snap_exp = self.data.chain_snapshot(self.df, expiry, expiry)
+
+                if snap_exp.empty:
+                    continue
+
+                S = snap_exp["S"].iloc[0]
+
+                exit_value = 0
+                for leg in legs:
+                    if leg.option_type == "C":
+                        intrinsic = max(0, (S - leg.strike) / S)
+                    else:
+                        intrinsic = max(0, (leg.strike - S) / S) 
+                    exit_value += intrinsic if leg.side == "sell" else -intrinsic
+
+                exit_value *= self.position_size
+
+            pnl = entry_premium - exit_value
+            pnl_pct = pnl / entry_premium if entry_premium > 0 else 0
+
+            trades.append({
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "expiry": expiry,
+                "exit_reason": exit_reason,
+                "entry_premium": entry_premium,
+                "exit_value": exit_value,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "legs": str([(l.instrument, l.side, l.price) for l in legs])
+            })
+
+        trades_df = pd.DataFrame(trades)
+        greeks_df = pd.DataFrame(greeks_rows)
+        
+        return trades_df, greeks_df
+
+    def calc_sharpe(self, trades_df: pd.DataFrame) -> float:
+        if trades_df.empty:
+            return 0.0
+
+        df = trades_df.sort_values("exit_time")
+
+        start = df["entry_time"].min().normalize()
+        end = df["exit_time"].max().normalize()
+        days = pd.date_range(start, end, freq="1D")
+
+        capital_series = pd.Series(index=days, dtype=float)
+        capital = self.capital
+
+        trade_idx = 0
+        ntrades = len(df)
+
+        for day in days:
+            while trade_idx < ntrades and df.iloc[trade_idx]["exit_time"].normalize() == day:
+                capital += df.iloc[trade_idx]["pnl"]
+                trade_idx += 1
+
+            capital_series[day] = capital
+
+        daily_returns = capital_series.pct_change().dropna()
+
+        if daily_returns.std() == 0:
+            return 0.0
+        
+        sharpe = ((daily_returns.mean()) / daily_returns.std()) * np.sqrt(365) 
+
+        return sharpe
+
+    def calc_stats(self, trades_df: pd.DataFrame) -> dict:
+        if trades_df.empty:
+            return {}
+
+        df = trades_df.sort_values("exit_time")
+        returns = df["pnl_pct"].values  # this is pl from each trade
+
+        equity = self.capital + df["pnl"].cumsum()  # check that it's not (1+returns).cumprod()
+        rolling_max = np.maximum.accumulate(equity)
+        drawdowns = (rolling_max - equity) / rolling_max  
+        max_dd = drawdowns.max()
+        
+        days = (df["exit_time"].max() - df["entry_time"].min()).days
+
+        if days > 0:
+            final_capital = equity.iloc[-1]
+            cagr = (final_capital / self.capital)**(365 / days) - 1
+        else:
+            cagr = 0.0
+            
+        wins = df[df["pnl"] > 0]
+        losses = df[df["pnl"] <= 0] 
+        sharpe = self.calc_sharpe(df)  
+
+        return equity, {
+            "total_trades": len(df),
+            "win_rate": len(wins) / len(df),
+            "total_return": equity.iloc[-1] - self.capital,
+            "annualised_return": cagr,
+            "max_drawdown": max_dd,
+            "avg_profit": wins["pnl"].mean() if len(wins) > 0 else 0,
+            "avg_loss": losses["pnl"].mean() if len(losses) > 0 else 0,
+            "sharpe_annual": sharpe,
+            "exit_reasons": df["exit_reason"].value_counts().to_dict()
+        }
+n_dte = 3
+end = datetime(2025, 11, 29, 19, 0, 0, tzinfo=timezone.utc)
+start = end - timedelta(days=60)
+    
+data_loader = DataLoader()
+df = data_loader.get_data("BTC", start, end, dte=n_dte, has_csv=False)
+
+if df.empty:
+    print("No data found")
+strategy = Strategy()
+backtester = Backtest(df, data_loader, strategy, entry_hours=6, candle_frequency="1min", # check freq
+                        hours_elapsed_limit=4, profit_target_pct=0.25, capital=1, position_size=1) 
+trades_df, greeks_df = backtester.backtest()
+trades_df.to_csv("backtest_trades.csv", index=False)
+greeks_df.to_csv("greeks.csv", index=False)
+equity, stats = backtester.calc_stats(trades_df)
+    
+print("\n=== BACKTEST RESULTS ===")
+print(f"Total trades: {stats['total_trades']}")
+print(f"Win rate: {stats['win_rate']:.1%}")
+print(f"Sharpe (annual): {stats['sharpe_annual']:.2f}")
+print(f"Total return: {stats['total_return']:.1%}")
+print(f"Annualised return: {stats['annualised_return']:.1%}")
+print(f"Max drawdown: {stats['max_drawdown']:.1%}")
+print(f"Avg profit: {stats['avg_profit']}")
+print(f"Avg loss: {stats['avg_loss']}")
+print(f"Exit reasons: {stats['exit_reasons']}")
+trades_df['equity'] = equity
+eq_df = trades_df[['exit_time', 'equity']]
+eq_df.to_csv("equity_curve.csv", index=False)
+print("[INFO] Saved equity curve to 'equity_curve.csv'.")
+
+plt.figure(figsize=(10, 6))
+plt.plot(eq_df['exit_time'], eq_df['equity'], label="Equity Curve", color='#A2D2FF')
+plt.title("Equity Curve Over Time")
+plt.xlabel("Exit Time")
+plt.ylabel("Equity")
+plt.grid(True)
+plt.xticks(rotation=45) 
+plt.tight_layout()
+plt.legend()
+plt.show()
