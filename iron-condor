@@ -1,3 +1,21 @@
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from enum import Enum
+import warnings
+warnings.filterwarnings('ignore')
+import json
+import math
+import time
+import os
+import re
+
+BASE_URL = "https://history.deribit.com/api/v2/public/get_last_trades_by_currency_and_time"
+
 @dataclass
 class Leg:
     instrument: str
@@ -158,3 +176,164 @@ class Greeks:
             df.at[i, 'theta'] = Greeks.bs_theta(S, K, T, r, sigma, option_type)
     
         return df
+class DataLoader:
+    def get_data(self, currency: str, start: datetime, end: datetime, dte: int, r: float = 0.04, has_csv: bool = False) -> pd.DataFrame:
+        filename = f"{currency.lower()}_options_{dte}dte.csv"
+
+        if has_csv and os.path.exists(filename):
+            print(f"{filename}. Loading {filename}...")
+            df = pd.read_csv(filename)
+            return df
+
+        print(f"Downloading data...")
+        trades = []
+        start_ts = int(start.timestamp() * 1000)
+        end_ts = int(end.timestamp() * 1000)
+
+        while start_ts < end_ts:
+            params = {
+                "currency": currency,
+                "kind": "option",
+                "start_timestamp": start_ts,
+                "end_timestamp": end_ts,
+                "count": 10000,
+                "sorting": "asc"
+            }
+
+            response = requests.get(BASE_URL, params=params)
+            data = response.json()
+
+            if "result" not in data or not data["result"]["trades"]:
+                break
+
+            batch = data["result"]["trades"]
+            trades.extend(batch)
+            start_ts = batch[-1]["timestamp"] + 1
+
+            print(f"Fetched {len(trades)} trades...")
+            time.sleep(0.2)
+
+        if not trades:
+            print("No trades downloaded.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(trades)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+
+        parts = df["instrument_name"].str.split("-", expand=True)
+        df["expiry"] = pd.to_datetime(parts[1], format="%d%b%y", utc=True)
+        df["strike"] = parts[2].astype(float)
+        df["option_type"] = parts[3]
+
+        df["expiry_hrs"] = (df["expiry"] - df["timestamp"]).dt.total_seconds() / 3600  # in hours
+        df = df[df["expiry_hrs"] >= 0] #added
+
+        df["spot_price"] = df["index_price"]
+
+        df = df[df["expiry_hrs"] <= dte * 24].copy() 
+        
+        columns_to_keep = [
+            'trade_seq', 'trade_id', 'timestamp', 'tick_direction', 'price',
+            'mark_price', 'iv', 'instrument_name', 'direction',
+            'contracts', 'amount', 'expiry',
+            'strike', 'option_type', 'expiry_hrs', 'spot_price'
+        ]
+        df = df[columns_to_keep]
+        df = Greeks.calculate_greeks(df, r=0.04)
+
+        print(f"[After filtering: {len(df)} trades with DTE <= {dte}.")
+        
+        df.to_csv(filename, index=False)
+        print(f"Saved to {filename}")
+
+        return df
+
+    def chain_snapshot(self, df: pd.DataFrame, ts: datetime, expiry: datetime) -> pd.DataFrame:
+        window = df[
+            (df["timestamp"] <= ts) &
+            (df["timestamp"] >= ts - timedelta(hours=1)) &
+            (df["expiry"] == expiry)
+        ]
+    
+        if window.empty:
+            return pd.DataFrame()
+
+        agg_cols = {
+            "mark_price": "last",
+            "iv": "last",
+            "spot_price": "last",
+            "timestamp": "last",
+            "delta": "last",
+            "gamma": "last",
+            "vega": "last",
+            "theta": "last"
+        }
+    
+        chain = window.groupby(["strike", "option_type"]).agg(agg_cols).reset_index()
+
+        chain = chain[chain["iv"] > 0]
+    
+        if chain.empty:
+            return pd.DataFrame()
+
+        S = chain["spot_price"].iloc[0]
+        T = (expiry - ts).total_seconds() / (365.25 * 24 * 3600)
+    
+        chain["S"] = S
+        chain["T"] = T
+    
+        return chain
+
+class Strategy:
+    def fit_legs(self, chain: pd.DataFrame, target_delta: float, option_type: str) -> pd.Series:
+        subset = chain[chain["option_type"] == option_type].copy()
+        if subset.empty:
+            return None
+        subset["delta_diff"] = (subset["delta"] - target_delta).abs()
+        return subset.loc[subset["delta_diff"].idxmin()]
+
+    def iron_condor(self, chain: pd.DataFrame) -> list:
+        sell_call = self.fit_legs(chain, 0.20, "C")
+        buy_call = self.fit_legs(chain, 0.05, "C")
+        sell_put = self.fit_legs(chain, -0.20, "P")
+        buy_put = self.fit_legs(chain, -0.05, "P")
+        
+        if any(x is None for x in [sell_call, buy_call, sell_put, buy_put]):
+            return None
+        
+        if sell_call["strike"] >= buy_call["strike"] or sell_put["strike"] <= buy_put["strike"]:
+            return None
+        
+        legs = [ # edited
+            Leg(f"C{int(sell_call['strike'])}", sell_call["strike"], "C", "sell", sell_call["delta"], sell_call["gamma"], 
+                sell_call["vega"], sell_call["theta"], sell_call["mark_price"], sell_call["iv"]),
+            Leg(f"C{int(buy_call['strike'])}", buy_call["strike"], "C", "buy", buy_call["delta"], buy_call["gamma"], 
+                buy_call["vega"], buy_call["theta"], buy_call["mark_price"], buy_call["iv"]),
+            Leg(f"P{int(sell_put['strike'])}", sell_put["strike"], "P", "sell", sell_put["delta"], sell_put["gamma"], 
+                sell_put["vega"], sell_put["theta"], sell_put["mark_price"], sell_put["iv"]),
+            Leg(f"P{int(buy_put['strike'])}", buy_put["strike"], "P", "buy", buy_put["delta"], buy_put["gamma"], 
+                buy_put["vega"], buy_put["theta"], buy_put["mark_price"], buy_put["iv"]),
+        ]
+        return legs
+
+    def calc_premium(self, legs: list) -> float:
+        return sum(leg.price if leg.side == "sell" else -leg.price for leg in legs)
+
+    def calc_current_value(self, chain: pd.DataFrame, legs: list) -> float:
+        value = 0
+        for leg in legs:
+            row = chain[(chain["strike"] == leg.strike) & (chain["option_type"] == leg.option_type)]
+            if row.empty or pd.isna(row["mark_price"].iloc[0]):
+                return None
+            price = row["mark_price"].iloc[0]
+            value += price if leg.side == "sell" else -price
+        return value
+    
+    def check_delta_breach(self, chain: pd.DataFrame, legs: list, threshold: float = 0.35) -> bool:
+        for leg in legs:
+            if leg.side == "sell":
+                row = chain[(chain["strike"] == leg.strike) &
+                            (chain["option_type"] == leg.option_type)]
+                if not row.empty and abs(row["delta"].iloc[0]) >= threshold:
+                    return True
+        return False
